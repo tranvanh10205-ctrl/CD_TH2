@@ -1,4 +1,4 @@
-# DINOv3 + TS-TCC for SpeechOcean762
+# DINOv3 + TS-TCC 
 
 > **A practical guide to the architecture, training pipeline, DINOv3 integration, loss functions, and parameter updates.**
 
