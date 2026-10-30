@@ -1,655 +1,502 @@
 # DINOv3 + TS-TCC for SpeechOcean762
 
-A self-supervised learning framework that integrates a pretrained DINOv3 Vision Transformer with the TS-TCC time-series contrastive learning framework for speech feature representation.
+> **A practical guide to the architecture, training pipeline, DINOv3 integration, loss functions, and parameter updates.**
+
+This project integrates a pretrained **DINOv3 ViT-S/16** backbone into the **TS-TCC** time-series contrastive learning pipeline. Speech input is represented as Log-Mel features, converted to an image-like tensor, encoded by DINOv3, and projected into a short feature sequence for the Temporal Contrasting (TC) module.
+
+The repository supports three training modes: **self-supervised**, **supervised**, and **linear evaluation** (`train_linear`).
+
+---
 
 ## Table of Contents
 
-1. [Project Overview](#1-project-overview)
-2. [System Overview](#2-system-overview)
-3. [Environment](#3-environment)
-4. [Setup](#4-setup)
-5. [Run and Verify](#5-run-and-verify)
-6. [Usage and Training Modes](#6-usage-and-training-modes)
-7. [DINOv3 Integration Details](#7-dinov3-integration-details)
-8. [Total Loss Function and Parameter Updates](#8-total-loss-function-and-parameter-updates)
-9. [Model Training and Evaluation](#9-model-training-and-evaluation)
-10. [Checkpoints and Outputs](#10-checkpoints-and-outputs)
-11. [Troubleshooting](#11-troubleshooting)
-12. [Limitations and Future Improvements](#12-limitations-and-future-improvements)
-13. [References](#13-references)
+- [1. Project Overview](#1-project-overview)
+- [2. System Overview](#2-system-overview)
+- [3. Repository Files](#3-repository-files)
+- [4. Environment](#4-environment)
+- [5. Setup](#5-setup)
+- [6. Run and Verify](#6-run-and-verify)
+- [7. DINOv3 Integration Details](#7-dinov3-integration-details)
+- [8. Loss Functions and Parameter Updates](#8-loss-functions-and-parameter-updates)
+- [9. Training Modes](#9-training-modes)
+- [10. Checkpoints and Outputs](#10-checkpoints-and-outputs)
+- [11. Troubleshooting](#11-troubleshooting)
+- [12. Limitations and Future Work](#12-limitations-and-future-work)
+- [13. References](#13-references)
 
 ---
 
 ## 1. Project Overview
 
-### 1.1 What is this project?
+### 1.1 What does the project do?
 
-This project combines **DINOv3**, a pretrained Vision Transformer, with **TS-TCC**, a time-series contrastive learning framework.
+The original TS-TCC pipeline uses a CNN-based encoder to extract features from time-series inputs. In this version, the encoder is replaced by a pretrained DINOv3 Vision Transformer, with an adapter that converts Log-Mel features into the input format expected by DINOv3.
 
-The main goal is to study whether pretrained visual features can be adapted to speech-related time-series data while keeping the temporal contrastive learning process of TS-TCC.
+The resulting feature sequence is passed to the existing TC module for self-supervised temporal learning. A classification head is also provided for labeled downstream tasks.
 
-Instead of using the original CNN encoder, the modified framework uses DINOv3 to extract features from Log-Mel representations of speech signals.
+### 1.2 Main components
 
-### 1.2 Main objectives
-
-- Replace the original CNN encoder with a pretrained DINOv3 backbone.
-- Convert Log-Mel features into an input format accepted by DINOv3.
-- Transform visual patch features into a temporal feature sequence.
-- Keep the Temporal Contrasting (TC) module for temporal representation learning.
-- Combine temporal contrastive losses with an NT-Xent contrastive loss.
-- Support self-supervised training and downstream classification.
-- Evaluate the learned representations on the SpeechOcean762 dataset.
-
-### 1.3 Main contributions
-
-| Component | Description |
+| Component | Role |
 |---|---|
-| Pretrained backbone | DINOv3 ViT-S/16 |
-| Input representation | Log-Mel features |
-| Feature adapter | Image conversion and feature projection |
-| Temporal learning | TS-TCC Temporal Contrasting module |
-| Self-supervised objective | Two temporal losses and NT-Xent |
-| Classification | Linear classification head |
-| Training control | Optional backbone freezing |
-| Model evaluation | Validation and test evaluation |
+| SpeechOcean762 data loader | Loads data, labels, and augmented views |
+| Log-Mel adapter | Converts `(B, 64, T)` features into three-channel images |
+| DINOv3 ViT-S/16 | Extracts pretrained visual representations |
+| Feature projection | Maps the DINOv3 hidden dimension to the TS-TCC feature dimension |
+| TC module | Calculates temporal contrastive loss and projection vectors |
+| NT-Xent loss | Encourages matching views to have similar representations |
+| Classifier | Produces class logits for supervised evaluation |
+| Trainer | Runs optimization, validation, and checkpoint saving |
 
-### 1.4 Important note
+### 1.3 Design goals
 
-DINOv3 is originally designed for visual representation learning. In this project, Log-Mel features are converted into image-like tensors so that DINOv3 can process them.
+- Reuse pretrained DINOv3 features.
+- Keep the temporal contrastive module from TS-TCC.
+- Use two augmented views for self-supervised training.
+- Support supervised classification and linear evaluation.
+- Keep the loss calculation and optimizer behavior easy to inspect.
 
-This is an adaptation of a visual backbone to speech-related features. It does not mean that DINOv3 was originally trained as a speech recognition model.
+> **Scope note:** This README describes the supplied code files. It does not claim that DINOv3 is a speech-native model or that this integration necessarily outperforms the original TS-TCC baseline.
 
 ---
 
 ## 2. System Overview
 
-### 2.1 Overall architecture
-
-The complete pipeline consists of five main stages:
-
-1. Input preparation.
-2. DINOv3 feature extraction.
-3. Feature projection.
-4. Temporal contrastive learning.
-5. Classification and evaluation.
-
-### 2.2 Architecture diagram
+### 2.1 Overall data flow
 
 ```mermaid
 flowchart TD
-    A["SpeechOcean762 Dataset"] --> B["Log-Mel Features"]
-    B --> C["Input Adapter"]
-    C --> D["Pretrained DINOv3 ViT-S/16"]
-    D --> E["Patch Token Extraction"]
-    E --> F["Feature Projection"]
-    F --> G["Temporal Feature Sequence"]
-    G --> H["TC Module"]
-    H --> I["Temporal Contrastive Loss"]
-    H --> J["Projection Vectors"]
-    J --> K["NT-Xent Loss"]
-    I --> L["Total Self-Supervised Loss"]
-    K --> L
-    L --> M["Backpropagation"]
-    M --> N["Optimizer Update"]
-    G --> O["Classification Head"]
-    O --> P["Class Predictions"]
+    A["SpeakingE Log-Mel input"] --> B["Input adapter"]
+    B --> C["Resize to 224 x 224"]
+    C --> D["Repeat to 3 channels and standardize"]
+    D --> E["Pretrained DINOv3 ViT-S/16"]
+    E --> F["Remove CLS and 4 register tokens"]
+    F --> G["196 patch tokens"]
+    G --> H["Reshape to 14 x 14 patch grid"]
+    H --> I["Average one grid axis"]
+    I --> J["Feature projection: hidden size to 128"]
+    J --> K["Feature sequence: B x 128 x 14"]
+    K --> L["TC module"]
+    L --> M["Two temporal contrastive losses"]
+    L --> N["Projection vectors"]
+    N --> O["NT-Xent loss"]
+    M --> P["Total self-supervised loss"]
+    O --> P
+    P --> Q["Backward pass"]
+    Q --> R["Optimizer update"]
+    J --> S["Flatten + Dropout + Linear classifier"]
+    S --> T["Class logits"]
 ```
 
-The classification head is used for downstream classification. During self-supervised training, the total contrastive loss does not automatically train the classification head unless the code explicitly connects that head to the training objective.
+The classifier branch is used for supervised training and evaluation. In self-supervised mode, the loss is calculated from the TC outputs and projection vectors, not directly from the classifier logits.
 
-### 2.3 Data flow and tensor shapes
+### 2.2 Expected tensor shapes
 
-The following table describes the expected tensor shapes in the integration.
+The following shapes describe the default configuration used by `DINOv3_Model`. `B` is the batch size and `T` is the number of input frames.
 
-| Stage | Operation | Expected shape |
+| Stage | Tensor shape | Explanation |
 |---|---|---|
-| Input | Log-Mel features | `(B, 64, 1536)` |
-| Image adapter | Resize and convert channels | `(B, 3, 224, 224)` |
-| DINOv3 | Extract hidden states | `(B, 201, 384)` |
-| Patch extraction | Remove CLS and register tokens | `(B, 196, 384)` |
-| Patch grid | Arrange tokens into a grid | `(B, 14, 14, 384)` |
-| Temporal reduction | Average one grid dimension | `(B, 14, 384)` |
-| Feature projection | Linear, LayerNorm and GELU | `(B, 14, 128)` |
-| TC input | Transpose dimensions | `(B, 128, 14)` |
-| Classification head | Pool and classify | `(B, 3)` |
+| Log-Mel input | `(B, 64, T)` | 64 Mel bins and `T` frames |
+| Add channel dimension | `(B, 1, 64, T)` | Single-channel image-like input |
+| Resize and repeat channels | `(B, 3, 224, 224)` | Input accepted by the selected vision backbone |
+| DINOv3 hidden states | Usually `(B, 201, 384)` | CLS + 4 register tokens + 196 patch tokens |
+| Remove special tokens | `(B, 196, 384)` | Patch tokens only |
+| Patch grid | `(B, 14, 14, 384)` | 14 by 14 grid |
+| Average one grid axis | `(B, 14, 384)` | Short sequence of patch features |
+| Feature projection | `(B, 14, 128)` | Linear + LayerNorm + GELU |
+| TC feature input | `(B, 128, 14)` | Channel-first format used by TC |
+| Classifier output | `(B, num_classes)` | Raw class logits |
+| TC projection output | `(B, 32)` under the default configuration | Used by NT-Xent |
 
-Here, `B` represents the batch size.
-
-The token shape assumes the selected DINOv3 model returns one CLS token, four register tokens and 196 patch tokens for a 224 × 224 input with patch size 16. The actual output shape should be checked against the installed model and configuration.
+The DINOv3 token count is checked at runtime. If the selected model returns a different number of patch or special tokens, the code raises an error rather than silently using an incorrect slice.
 
 ---
 
-## 3. Environment
+## 3. Repository Files
 
-### 3.1 Requirements
+The supplied code package contains the following important files. Paths may need to be adjusted to match the directory layout in the full repository.
 
-The project uses Python and PyTorch for model training.
+| File | Responsibility |
+|---|---|
+| `main_dinov3.py` | DINOv3 entry point, arguments, data loading, model and optimizer setup, smoke test, training, and final test evaluation |
+| `dinov3_model.py` | DINOv3 backbone, image adapter, patch processing, feature projection, and classifier |
+| `trainer_dinov3.py` | Self-supervised loss, evaluation, training loop, gradient clipping, scheduler, and checkpoint saving |
+| `TC.py` | Temporal Contrasting module, prediction layers, sequence Transformer, and projection head |
+| `loss.py` | Original TS-TCC NT-Xent implementation used by the CNN trainer |
+| `main.py` | Original TS-TCC entry point |
+| `trainer.py` | Original TS-TCC training and evaluation logic |
+| `model.py` | Original CNN-based TS-TCC encoder and classifier |
+| `smoke_test_dinov3.py` | Checks data loading, model output shapes, and TC forward calls |
+| `test_dinov3.py` | Checks whether the pretrained DINOv3 model can be loaded and run |
+| `requirements_before_dinov3.txt` | A dependency snapshot from before the DINOv3 integration; review it before using it as an installation file |
 
-The main dependencies include:
+### Key execution path
+
+| Step | File/function | What happens |
+|---|---|---|
+| 1 | `main_dinov3.py` → `main()` | Reads command-line arguments and creates the experiment directory |
+| 2 | `data_generator(...)` | Loads training, validation, and test data |
+| 3 | `DINOv3_Model(configs)` | Creates the backbone, feature projection, and classifier |
+| 4 | `TC(configs, device)` | Creates the temporal contrastive module |
+| 5 | `combined_self_supervised_loss(...)` | Calculates the two TC losses and NT-Xent |
+| 6 | `Trainer_DINOv3(...)` | Runs the training and validation loop |
+| 7 | `evaluate(...)` | Calculates validation or test metrics for the selected mode |
+| 8 | `save_checkpoint(...)` | Saves model, TC, optimizer, epoch, and validation information |
+
+---
+
+## 4. Environment
+
+### 4.1 Main requirements
+
+The supplied code uses:
 
 - Python
 - PyTorch
-- Transformers
+- Hugging Face Transformers
 - NumPy
-- scikit-learn
-- Other dependencies required by the original TS-TCC implementation
+- The project's TS-TCC data loader and configuration files
 
-The exact versions should be taken from the project's dependency files or the environment in which the experiments were tested.
+The exact compatible versions depend on the environment in which the code is run. The file `requirements_before_dinov3.txt` is explicitly a pre-integration snapshot, so it should not be treated as a verified complete dependency list for DINOv3.
 
-### 3.2 Hardware
-
-GPU training is recommended because DINOv3 adds a pretrained Transformer backbone to the original pipeline.
-
-A CUDA-compatible NVIDIA GPU can reduce training time. CPU execution may be useful for debugging, but can be significantly slower.
-
-### 3.3 Check the environment
+### 4.2 Check Python and PyTorch
 
 ```bash
 python --version
-python -c "import torch; print(torch.__version__)"
-python -c "import torch; print(torch.cuda.is_available())"
+python -c "import torch; print('PyTorch:', torch.__version__)"
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+python -c "import transformers; print('Transformers:', transformers.__version__)"
 ```
 
-To check the Transformers installation:
+To display the GPU name:
 
 ```bash
-python -c "import transformers; print(transformers.__version__)"
+python -c "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU mode')"
 ```
 
-If CUDA is available, check the GPU name:
+### 4.3 Hardware
 
-```bash
-python -c "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
-```
+A CUDA-compatible NVIDIA GPU is recommended for training. CPU mode can be useful for debugging, but DINOv3 inference and training may be slow.
 
 ---
 
-## 4. Setup
+## 5. Setup
 
-### 4.1 Clone the repository
+### 5.1 Clone the repository
 
 ```bash
 git clone https://github.com/tranvanh10205-ctrl/CD_TH2.git
 cd CD_TH2
 ```
 
-### 4.2 Create a virtual environment
+### 5.2 Create a virtual environment
 
-On Windows:
+**Windows PowerShell**
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-On Linux or macOS:
+**Linux or macOS**
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 4.3 Install dependencies
+### 5.3 Install dependencies
 
-If the project contains a `requirements.txt` file:
+If the repository has a maintained `requirements.txt` file, use it:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Otherwise, install the dependencies specified by the project configuration and the original TS-TCC implementation.
+If it does not, install the dependencies required by the current source code and the original TS-TCC data pipeline. Avoid installing `requirements_before_dinov3.txt` without checking its encoding and version compatibility first.
 
-**Important:** The dependency list should be checked against the actual source code before reproducing the experiments.
+### 5.4 Prepare the dataset
 
-### 4.4 Prepare the dataset
-
-Prepare the SpeechOcean762 dataset and its corresponding Log-Mel features according to the dataset preprocessing pipeline used by the project.
-
-Check that:
-
-- The input tensors have the expected dimensions.
-- Training, validation and test splits are separated correctly.
-- Labels are mapped to the expected classes.
-- The data loader returns tensors compatible with the selected model.
-
-The exact dataset directory and preprocessing commands depend on the local project configuration.
-
----
-
-## 5. Run and Verify
-
-### 5.1 Start training
-
-The exact command depends on the entry point and argument parser in the checked-out source code.
-
-For the DINOv3 integration, the main training entry point is described as:
-
-```bash
-python main_dinov3.py
-```
-
-If the implementation requires command-line arguments, provide the dataset path, training mode, device and experiment settings supported by the actual script.
-
-Do not assume that every argument from the original TS-TCC `main.py` is also supported by `main_dinov3.py`.
-
-### 5.2 Verify the forward pass
-
-Before starting a complete training run, verify that the model can process one batch.
-
-Check the following tensors:
-
-- Input Log-Mel features.
-- DINOv3 hidden states.
-- Patch tokens.
-- Projected temporal features.
-- Classification logits.
-- Self-supervised loss.
-
-Expected output shapes include:
+The DINOv3 entry point defaults to:
 
 ```text
-Input features:       (B, 64, 1536)
-Projected features:   (B, 128, 14)
-Classification logits:(B, 3)
+./data/SpeechOcean762
 ```
 
-The exact shape of intermediate tensors depends on the implementation.
-
-### 5.3 Verify the loss
-
-During self-supervised training, the loss should be a finite scalar.
-
-In PyTorch, the following check can be used:
+The data loader is called from `main_dinov3.py`:
 
 ```python
-if not torch.isfinite(loss):
-    raise RuntimeError("The training loss is not finite.")
+train_dl, valid_dl, test_dl = data_generator(
+    args.data_path, configs, args.training_mode
+)
 ```
 
-Also check that gradients are present for the parameters that are expected to be trainable.
+Make sure the dataset directory matches the data loader's expected structure. Each batch is expected to provide four values:
 
-A successful forward pass does not guarantee that the optimizer updates the intended parameters. The trainable parameter list should be inspected separately.
+```text
+data, labels, aug1, aug2
+```
+
+- `data`: original input used for supervised training/evaluation.
+- `labels`: class labels.
+- `aug1`: first augmented view.
+- `aug2`: second augmented view.
+
+The precise file naming and preprocessing requirements are defined by the data loader and configuration, not by `main_dinov3.py` alone.
 
 ---
 
-## 6. Usage and Training Modes
+## 6. Run and Verify
 
-The available training modes depend on the implementation.
+### 6.1 Test DINOv3 loading
 
-### 6.1 Self-supervised learning
+Run the standalone backbone test from the directory containing `test_dinov3.py`:
 
-Self-supervised training learns representations from different augmented views of the same input without directly using class labels in the contrastive objective.
+```bash
+python test_dinov3.py
+```
 
-The two augmented views are passed through the encoder and temporal model. Their losses are combined into a total self-supervised loss.
+This test loads the configured pretrained model and sends a dummy tensor with shape `(1, 3, 224, 224)` through it.
 
-### 6.2 Supervised classification
+### 6.2 Test the full DINOv3 + TC forward path
 
-Supervised classification uses labeled data to train a classification head.
+Run:
 
-The usual objective is Cross-Entropy:
+```bash
+python smoke_test_dinov3.py
+```
 
-\[
-\mathcal{L}_{CE}
-=
--\frac{1}{B}\sum_{i=1}^{B}
-\log p_{i,y_i}
-\]
+This test checks that the data loader returns batches, the DINOv3 model returns logits and features, and the TC module returns losses and projection vectors.
 
-where:
+Expected shapes in the default configuration include:
 
-- \(B\) is the batch size.
-- \(p_{i,y_i}\) is the predicted probability assigned to the correct class.
-- \(y_i\) is the ground-truth class.
+```text
+DINOv3 features: (B, 128, 14)
+DINOv3 logits:   (B, num_classes)
+TC projections:  (B, 32)
+```
 
-PyTorch's `CrossEntropyLoss` accepts raw logits and class indices. A separate softmax operation is not required before calling it.
+The actual batch size depends on the configuration and the last batch.
 
-### 6.3 Linear evaluation
+### 6.3 Start self-supervised training
 
-Linear evaluation measures the quality of pretrained or self-supervised features by training a classification head while keeping the feature extractor fixed.
+```bash
+python main_dinov3.py --training_mode self_supervised --device cuda
+```
 
-If the implementation follows this approach:
+### 6.4 Start supervised training
 
-- The DINOv3 backbone is frozen.
-- The feature projection is frozen.
-- The classifier is trained.
-- The optimizer updates only the classifier parameters.
+```bash
+python main_dinov3.py --training_mode supervised --device cuda
+```
 
-These settings must be verified in the actual training code.
+### 6.5 Run linear evaluation
+
+Linear evaluation loads a self-supervised checkpoint from the matching experiment and run directory. First run self-supervised training, then use the same seed and directory settings:
+
+```bash
+python main_dinov3.py --training_mode train_linear --device cuda
+```
+
+If the checkpoint cannot be found, check `--logs_save_dir`, `--experiment_description`, `--run_description`, and `--seed`. They must match the self-supervised run.
+
+### 6.6 Useful command-line arguments
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--training_mode` | `self_supervised` | `self_supervised`, `supervised`, or `train_linear` |
+| `--seed` | `0` | Random seed |
+| `--device` | `cuda` | Compute device, such as `cuda` or `cpu` |
+| `--data_path` | `./data/SpeechOcean762` | Dataset directory |
+| `--logs_save_dir` | `experiments_logs/SpeechOcean762_DINOv3_TS-TCC` | Root directory for experiment logs and checkpoints |
+| `--experiment_description` | `Exp1` | Experiment folder name |
+| `--run_description` | `DINOv3` | Run folder name |
+
+For a CPU smoke test, use:
+
+```bash
+python main_dinov3.py --training_mode self_supervised --device cpu
+```
+
+Full CPU training may be slow.
 
 ---
 
 ## 7. DINOv3 Integration Details
 
-This section explains the main architectural changes required to integrate DINOv3 into TS-TCC.
+This section identifies where DINOv3 is loaded, how its outputs are adapted, and where it is connected to TS-TCC.
 
-### 7.1 Main files
+### 7.1 Where is DINOv3 loaded?
 
-The integration is described using the following file structure.
+**File:** `dinov3_model.py`  
+**Class:** `DINOv3_Model`  
+**Location:** `DINOv3_Model.__init__()`
 
-| File | Main responsibility |
-|---|---|
-| `models/dinov3_model.py` | DINOv3 backbone, input adapter, feature projection and classifier |
-| `main_dinov3.py` | Configuration, model creation, optimizer setup and training entry point |
-| `trainer/trainer_dinov3.py` | Training loop, contrastive losses, evaluation and checkpoint saving |
-| `models/TC.py` | Temporal Contrasting module inherited from TS-TCC |
-| `config_files/` | Dataset and model configuration, if present |
-
-The file names above must match the source files in the actual repository before this table is used as a verified code map.
-
-### 7.2 Step 1: Load the pretrained DINOv3 model
-
-The model initialization is described by the following pattern:
+The backbone is created with:
 
 ```python
 self.backbone = AutoModel.from_pretrained(model_id)
 ```
 
-The default model ID described in the current project documentation is:
+The default model ID is:
 
 ```text
 facebook/dinov3-vits16-pretrain-lvd1689m
 ```
 
-This loads a pretrained DINOv3 ViT-S/16 model through the Hugging Face Transformers interface.
+The hidden size is read from the model configuration when available. For ViT-S/16, it is expected to be 384.
 
-The backbone provides contextual visual features. The project then adapts these features to a temporal learning task.
+### 7.2 Where is the backbone frozen?
 
-The model name and loading method should be checked against the actual source code and installed Transformers version.
-
-### 7.3 Step 2: Freeze or unfreeze the backbone
-
-A typical freezing implementation is:
+In `dinov3_model.py`, the configuration field `dinov3_freeze_backbone` controls whether the pretrained backbone is frozen:
 
 ```python
 if self.freeze_backbone:
-    for parameter in self.backbone.parameters():
-        parameter.requires_grad = False
+    for p in self.backbone.parameters():
+        p.requires_grad = False
 ```
 
-When the backbone is frozen:
+The forward pass also uses `torch.no_grad()` when the backbone is frozen. The model's `train()` method keeps the frozen backbone in evaluation mode.
 
-- The pretrained DINOv3 parameters do not receive optimizer updates.
-- The forward pass still computes DINOv3 features.
-- Trainable layers after the backbone can still learn.
-- Memory and training requirements may be reduced, depending on how the forward pass is implemented.
+| Setting | Effect |
+|---|---|
+| `dinov3_freeze_backbone = True` | DINOv3 weights are not updated |
+| `dinov3_freeze_backbone = False` | Gradients can pass through DINOv3 and its parameters can be updated if included in the optimizer |
 
-When the backbone is unfrozen, gradients can update its parameters if the loss depends on its output and the optimizer includes those parameters.
+With the default frozen backbone, the feature projection and classifier remain trainable unless a training mode freezes them separately.
 
-Freezing and unfreezing are different from calling `model.eval()`. Evaluation mode controls layers with training-dependent behavior, while `requires_grad` controls whether parameters receive gradients.
+### 7.3 How is Log-Mel input converted?
 
-### 7.4 Step 3: Convert Log-Mel features into images
+**File:** `dinov3_model.py`  
+**Function:** `_to_rgb_images()`
 
-DINOv3 expects image-like inputs.
+The input is expected to have shape `(B, mel_bins, frames)`. The function:
 
-The speech feature tensor is described as:
+1. Checks that the input is three-dimensional.
+2. Adds a single channel.
+3. Resizes the tensor to `224 x 224` using bilinear interpolation.
+4. Repeats the channel three times.
+5. Standardizes each sample using its mean and standard deviation.
 
-\[
-X \in \mathbb{R}^{B \times 64 \times 1536}
-\]
+The resulting tensor has shape `(B, 3, 224, 224)`.
 
-The input adapter converts this tensor into:
+This adapter is required because the selected DINOv3 backbone accepts image tensors. It does not imply that the input becomes a natural image.
 
-\[
-X_{\mathrm{image}}
-\in \mathbb{R}^{B \times 3 \times 224 \times 224}
-\]
+### 7.4 How are patch tokens extracted?
 
-The main operations are:
+**File:** `dinov3_model.py`  
+**Function:** `forward()`
 
-1. Add a channel dimension.
-2. Resize the feature representation to 224 × 224.
-3. Repeat or expand the single channel to three channels.
-4. Normalize the input according to the implementation.
-
-This is a practical conversion step. It does not turn the Log-Mel representation into a natural photograph; it only makes the tensor compatible with the visual backbone.
-
-### 7.5 Step 4: Extract patch tokens
-
-For a 224 × 224 input and patch size 16, the patch grid is:
-
-\[
-\frac{224}{16}\times\frac{224}{16}
-=14\times14=196
-\]
-
-The output contains the special tokens and patch tokens used by the selected DINOv3 architecture.
-
-The integration removes the CLS token and four register tokens according to the described implementation:
+The backbone is called here:
 
 ```python
 outputs = self.backbone(pixel_values=images)
 tokens = outputs.last_hidden_state
+```
+
+The code then removes the CLS token and four register tokens:
+
+```python
 patch_tokens = tokens[:, 1 + 4:, :]
 ```
 
-The remaining patch tokens have the expected shape:
+For the expected default input, 196 patch tokens remain. The code checks the token count before reshaping.
 
-\[
-(B,196,384)
-\]
+| Operation | Expected shape |
+|---|---|
+| DINOv3 hidden states | `(B, 201, 384)` |
+| Remove 1 CLS + 4 register tokens | `(B, 196, 384)` |
+| Reshape to patch grid | `(B, 14, 14, 384)` |
+| Average one grid axis | `(B, 14, 384)` |
+| Feature projection | `(B, 14, 128)` |
+| Transpose for TC | `(B, 128, 14)` |
 
-Here, 384 is the hidden dimension of ViT-S/16.
+The special-token count is specific to the selected model implementation. If a different DINOv3 variant is used, verify its token layout before reusing the same slice.
 
-### 7.6 Step 5: Convert patch features into a temporal sequence
+### 7.5 Feature projection and classification
 
-The patch tokens are arranged into a two-dimensional grid:
-
-\[
-(B,196,384)
-\rightarrow
-(B,14,14,384)
-\]
-
-The model averages one spatial dimension:
-
-\[
-(B,14,14,384)
-\rightarrow
-(B,14,384)
-\]
-
-A feature projection then maps the hidden dimension from 384 to 128:
+The feature projection is defined in `DINOv3_Model.__init__()`:
 
 ```python
-sequence = patch_grid.mean(dim=1)
-sequence = self.feature_projection(sequence)
-features = sequence.transpose(1, 2).contiguous()
+self.feature_projection = nn.Sequential(
+    nn.Linear(hidden_size, self.feature_channels),
+    nn.LayerNorm(self.feature_channels),
+    nn.GELU(),
+)
 ```
 
-The result is:
+This maps the DINOv3 hidden dimension to `configs.final_out_channels`, which is 128 in the expected configuration.
 
-\[
-Z\in\mathbb{R}^{B\times128\times14}
-\]
+The classifier is also defined in `dinov3_model.py`:
 
-This representation is designed to match the input format expected by the TC module.
+```python
+self.classifier = nn.Linear(
+    self.feature_channels * self.grid_size,
+    int(configs.num_classes)
+)
+```
 
-**Important limitation:** Averaging one grid dimension reduces spatial information. The resulting sequence should not automatically be interpreted as a perfectly time-aligned speech sequence. It is a temporal representation constructed from image-like Log-Mel features.
+In `forward()`, the projected features are flattened, passed through dropout, and mapped to class logits. The model returns:
 
-### 7.7 Step 6: Connect DINOv3 to TS-TCC
+```python
+return logits, features
+```
 
-The integration replaces the original encoder while keeping the temporal learning component.
+where `features` has shape `(B, 128, 14)` under the default configuration.
 
-The overall connection is:
+### 7.6 Where is DINOv3 connected to TS-TCC?
+
+**File:** `main_dinov3.py`
+
+The model and TC module are initialized separately:
+
+```python
+model = DINOv3_Model(configs).to(device)
+temporal_model = TC(configs, device).to(device)
+```
+
+**File:** `trainer_dinov3.py`
+
+During self-supervised training, the trainer calls `combined_self_supervised_loss(...)`. That function runs the DINOv3 model on both augmented views and sends the resulting feature tensors to the TC module.
 
 ```mermaid
 flowchart LR
-    A["Log-Mel Input"] --> B["DINOv3 Backbone"]
-    B --> C["Feature Projection"]
-    C --> D["Temporal Features"]
-    D --> E["TC Module"]
-    E --> F["Temporal Loss"]
-    E --> G["Projection Vectors"]
-    G --> H["NT-Xent Loss"]
+    A["main_dinov3.py"] --> B["DINOv3_Model"]
+    A --> C["TC"]
+    A --> D["Trainer_DINOv3"]
+    D --> E["combined_self_supervised_loss"]
+    E --> B
+    E --> C
+    C --> F["TC losses and projection vectors"]
+    F --> G["Total loss"]
+    G --> H["Backward and optimizer steps"]
 ```
 
-The main architectural change is the feature extractor and its input/output adapter. The TC module continues to perform temporal contrastive learning on the projected sequence.
+### 7.7 What is kept from the original TS-TCC implementation?
 
-### 7.8 Step 7: Connect the classifier
+The integration reuses the TC module from `TC.py`. It retains the temporal prediction mechanism, sequence Transformer, projection head, and the temporal contrastive objective returned by `TC.forward()`.
 
-The classification head receives features from the DINOv3 model and produces class logits:
-
-\[
-Z\rightarrow\text{Pooling}
-\rightarrow\text{Dropout}
-\rightarrow\text{Linear}
-\rightarrow\text{Logits}
-\]
-
-For a three-class task, the expected output shape is:
-
-\[
-\text{Logits}\in\mathbb{R}^{B\times3}
-\]
-
-The classification head is trained using labeled data when the selected training mode uses supervised classification.
+The main architectural change is the feature extractor and the adapter required to convert Log-Mel input into DINOv3 features. The self-supervised loss used by the DINOv3 trainer is explicitly implemented in `trainer_dinov3.py`.
 
 ---
 
-## 8. Total Loss Function and Parameter Updates
+## 8. Loss Functions and Parameter Updates
 
-This section describes how the loss is constructed, how gradients flow through the network, and which parameters can be updated.
+This section describes the exact loss structure used by the supplied DINOv3 trainer and distinguishes it from the supervised objective.
 
-The exact implementation should be verified in `trainer/trainer_dinov3.py` before reporting experimental results.
+### 8.1 Self-supervised loss: where is it implemented?
 
-### 8.1 Two augmented views
+**File:** `trainer_dinov3.py`  
+**Function:** `combined_self_supervised_loss()`
 
-Self-supervised learning starts with two augmented views of the same input:
+The function:
 
-\[
-X_1=\operatorname{Aug}_1(X)
-\]
+1. Runs the model on `aug1` and `aug2`.
+2. Normalizes the feature tensors along the channel dimension.
+3. Calls the TC module in both directions.
+4. Calculates NT-Xent using the two projection vectors.
+5. Combines the three terms into one scalar loss.
 
-\[
-X_2=\operatorname{Aug}_2(X)
-\]
-
-The two views are processed by the DINOv3 model:
-
-\[
-Z_1=f_\theta(X_1)
-\]
-
-\[
-Z_2=f_\theta(X_2)
-\]
-
-where:
-
-- \(f_\theta\) is the DINOv3 encoder and feature projection.
-- \(\theta\) represents the parameters of these components.
-- \(Z_1\) and \(Z_2\) are temporal feature sequences.
-
-The same model weights are used for both views.
-
-### 8.2 Temporal contrastive losses
-
-The TC module processes the two feature sequences in both orders:
-
-```python
-tc_loss1, projection1 = temporal_model(features1, features2)
-tc_loss2, projection2 = temporal_model(features2, features1)
-```
-
-This produces:
-
-\[
-\mathcal{L}_{TC}^{(1)}
-=
-\mathcal{L}_{TC}(Z_1,Z_2)
-\]
-
-\[
-\mathcal{L}_{TC}^{(2)}
-=
-\mathcal{L}_{TC}(Z_2,Z_1)
-\]
-
-The two terms represent temporal contrastive objectives with reversed input order.
-
-Using both directions allows the objective to consider both feature sequences as the reference and the comparison sequence.
-
-The internal calculation of each TC loss is defined by the TC module. Its exact formula should be taken from `models/TC.py`, rather than inferred only from the trainer.
-
-### 8.3 NT-Xent contrastive loss
-
-The temporal model also produces projection vectors for the two views:
-
-\[
-P_1=g(Z_1,Z_2)
-\]
-
-\[
-P_2=g(Z_2,Z_1)
-\]
-
-Here, \(g\) represents the projection operation implemented by the TC module.
-
-The NT-Xent loss encourages representations of corresponding views to be similar relative to other samples in the batch.
-
-For normalized projection vectors \(u_i\) and \(u_j\), their temperature-scaled similarity is:
-
-\[
-s_{ij}=
-\frac{u_i^\top u_j}{\tau}
-\]
-
-where \(\tau\) is the temperature parameter.
-
-For a positive pair \(i,j\), the contrastive objective can be written as:
-
-\[
-\ell_{i,j}
-=
--\log
-\frac{\exp(s_{ij})}
-{\sum_{k\ne i}\exp(s_{ik})}
-\]
-
-The denominator contains the other candidates in the contrastive batch. The exact reduction and pair construction depend on the implementation of `nt_xent_loss`.
-
-### 8.4 Total self-supervised loss
-
-The total loss described for this integration is:
-
-\[
-\boxed{
-\mathcal{L}_{\mathrm{total}}
-=
-\mathcal{L}_{TC}^{(1)}
-+
-\mathcal{L}_{TC}^{(2)}
-+
-0.7\mathcal{L}_{NT\text{-}Xent}
-}
-\]
-
-The three components are:
-
-| Loss component | Role | Weight |
-|---|---|---:|
-| \(\mathcal{L}_{TC}^{(1)}\) | Temporal contrastive learning, first order | 1.0 |
-| \(\mathcal{L}_{TC}^{(2)}\) | Temporal contrastive learning, reversed order | 1.0 |
-| \(\mathcal{L}_{NT\text{-}Xent}\) | Contrastive learning between projection vectors | 0.7 |
-
-The coefficient 0.7 is the weighting factor described for this integration. It is a hyperparameter, not a value learned automatically by the optimizer.
-
-The total loss balances temporal representation learning and projection-level contrastive learning.
-
-### 8.5 Where is the total loss calculated?
-
-The described code organization places the loss calculation in:
-
-`trainer/trainer_dinov3.py`
-
-The relevant functions are expected to include:
-
-- `nt_xent_loss`
-- `combined_self_supervised_loss`
-- `evaluate`
-- The training loop inside `Trainer_DINOv3`
-
-The conceptual implementation is:
+The key implementation is equivalent to:
 
 ```python
 tc_loss1, projection1 = temporal_model(features1, features2)
@@ -658,375 +505,341 @@ tc_loss2, projection2 = temporal_model(features2, features1)
 ntxent = nt_xent_loss(
     projection1,
     projection2,
-    temperature=temperature,
+    temperature=configs.Context_Cont.temperature
 )
 
-total_loss = tc_loss1 + tc_loss2 + 0.7 * ntxent
+loss = tc_loss1 + tc_loss2 + 0.7 * ntxent
 ```
 
-This snippet illustrates the documented loss structure. Variable names, function arguments and return values must be checked against the actual source.
+### 8.2 Total self-supervised loss
 
-### 8.6 Total loss flow diagram
+The total objective is:
+
+```text
+Total Loss = TC Loss 1 + TC Loss 2 + 0.7 * NT-Xent Loss
+```
+
+In mathematical notation:
+
+`L_total = L_TC_1 + L_TC_2 + 0.7 * L_NTXent`
+
+This plain-text formula is intentionally used here to avoid MathJax rendering differences across Markdown viewers.
+
+| Term | Source | Meaning | Weight |
+|---|---|---|---:|
+| `tc_loss1` | `TC(features1, features2)` | Temporal contrastive objective for the first ordering | 1.0 |
+| `tc_loss2` | `TC(features2, features1)` | Temporal contrastive objective for the reversed ordering | 1.0 |
+| `ntxent` | `nt_xent_loss(projection1, projection2, ...)` | Contrastive objective over the projection vectors | 0.7 |
+
+The coefficient `0.7` is a fixed hyperparameter in the supplied function. It is not learned by the optimizer.
+
+### 8.3 What does the TC module calculate?
+
+**File:** `TC.py`  
+**Class:** `TC`  
+**Function:** `forward()`
+
+The TC module receives two feature sequences in channel-first format. It transposes them to sequence-first format, selects future time steps from the second view, processes the observed prefix with `Seq_Transformer`, and uses prediction layers to score the selected future representations.
+
+The returned values are:
+
+```python
+return nce, self.projection_head(c_t)
+```
+
+- `nce` is the temporal contrastive loss for that ordering.
+- `self.projection_head(c_t)` is a projection vector used by the NT-Xent objective.
+
+The detailed temporal objective is implemented inside `TC.forward()`. It should not be confused with the separate NT-Xent calculation.
+
+### 8.4 How does NT-Xent work in this version?
+
+**File:** `trainer_dinov3.py`  
+**Function:** `nt_xent_loss()`
+
+The supplied DINOv3 trainer implements NT-Xent directly. It expects two two-dimensional projection tensors with the same shape `(B, D)` and a batch size of at least two.
+
+Its main steps are:
+
+1. Normalize each projection vector.
+2. Concatenate the two views into `2B` representations.
+3. Calculate the pairwise similarity matrix.
+4. Divide similarity scores by the temperature.
+5. Mask self-similarity on the diagonal.
+6. Set the matching view from the other augmentation as the positive target.
+7. Apply cross-entropy to the similarity matrix.
+
+After normalization, the dot product between two vectors is their cosine similarity. The temperature controls how strongly differences between similarity scores affect the contrastive objective.
+
+### 8.5 Total loss flow
 
 ```mermaid
 flowchart TD
-    A["Input Batch"] --> B["Create Two Augmented Views"]
-    B --> C["DINOv3 + Feature Projection"]
-    C --> D["Features 1"]
-    C --> E["Features 2"]
-
-    D --> F["TC: View 1, View 2"]
+    A["Batch: data, labels, aug1, aug2"] --> B["DINOv3 model on aug1"]
+    A --> C["DINOv3 model on aug2"]
+    B --> D["features1"]
+    C --> E["features2"]
+    D --> F["TC(features1, features2)"]
     E --> F
-    E --> G["TC: View 2, View 1"]
+    E --> G["TC(features2, features1)"]
     D --> G
-
-    F --> H["TC Loss 1"]
-    G --> I["TC Loss 2"]
-    F --> J["Projection 1"]
-    G --> K["Projection 2"]
-
-    J --> L["NT-Xent Loss"]
+    F --> H["tc_loss1"]
+    G --> I["tc_loss2"]
+    F --> J["projection1"]
+    G --> K["projection2"]
+    J --> L["NT-Xent"]
     K --> L
-
-    H --> M["Total Loss"]
+    H --> M["loss = tc_loss1 + tc_loss2 + 0.7 * ntxent"]
     I --> M
-    L --> N["Multiply by 0.7"]
-    N --> M
-
-    M --> O["Backward Pass"]
-    O --> P["Optimizer Step"]
+    L --> M
+    M --> N["loss.backward()"]
+    N --> O["Gradient clipping"]
+    O --> P["model_optimizer.step()"]
+    O --> Q["temporal_optimizer.step()"]
 ```
 
-The optimizer step updates only parameters that are trainable and included in the optimizer. Frozen parameters remain unchanged.
+In the actual trainer, the temporal optimizer step occurs only in `self_supervised` mode. The model optimizer step occurs in all supported modes.
 
-### 8.7 What happens during backpropagation?
+### 8.6 Backpropagation and parameter updates
 
-The training process can be described in six steps.
+**File:** `trainer_dinov3.py`  
+**Function:** `Trainer_DINOv3()`
 
-**Step 1: Forward pass**
-
-The two augmented views pass through DINOv3 and the feature projection. Their temporal features are sent to the TC module.
-
-**Step 2: Loss calculation**
-
-The training code calculates the two TC losses and the NT-Xent loss, then combines them into one scalar.
-
-**Step 3: Gradient calculation**
-
-PyTorch calculates gradients of the total loss with respect to the trainable parameters connected to that loss.
-
-For a trainable parameter \(\theta\):
-
-\[
-\nabla_\theta\mathcal{L}_{total}
-=
-\nabla_\theta\mathcal{L}_{TC}^{(1)}
-+
-\nabla_\theta\mathcal{L}_{TC}^{(2)}
-+
-0.7\nabla_\theta\mathcal{L}_{NT\text{-}Xent}
-\]
-
-This expression follows from the linear combination of loss terms, provided that all three terms depend on \(\theta\).
-
-**Step 4: Gradient reset**
-
-The optimizer's gradients are cleared before the next update, usually using:
+The core update sequence is:
 
 ```python
-optimizer.zero_grad()
+model_optimizer.zero_grad(set_to_none=True)
+temporal_optimizer.zero_grad(set_to_none=True)
+
+loss.backward()
+
+torch.nn.utils.clip_grad_norm_(..., max_norm=1.0)
+
+model_optimizer.step()
 ```
 
-**Step 5: Backward pass**
-
-The gradients are calculated using:
+The temporal optimizer is stepped only during self-supervised training:
 
 ```python
-total_loss.backward()
+if training_mode == "self_supervised":
+    temporal_optimizer.step()
 ```
 
-**Step 6: Parameter update**
+What each operation does:
 
-The optimizer updates its registered trainable parameters:
+| Operation | Purpose |
+|---|---|
+| `zero_grad(...)` | Clears gradients from the previous iteration |
+| `loss.backward()` | Computes gradients of the current loss |
+| `clip_grad_norm_(..., max_norm=1.0)` | Limits the combined gradient norm for the supplied parameter list |
+| `model_optimizer.step()` | Updates trainable parameters registered in the model optimizer |
+| `temporal_optimizer.step()` | Updates TC parameters during self-supervised training |
+
+The optimizer can only update parameters that are included in it, have gradients, and are not frozen.
+
+### 8.7 Which parameters are updated in each mode?
+
+| Parameter group | `self_supervised` | `supervised` | `train_linear` |
+|---|---|---|---|
+| DINOv3 backbone | Frozen by default; can be trainable if configured unfrozen | Frozen by default; can be trainable if configured unfrozen | Frozen |
+| Feature projection | Updated if trainable | Updated if trainable | Frozen |
+| Classifier | Included in the model optimizer, but not directly trained by the contrastive loss | Updated using Cross-Entropy | Updated using Cross-Entropy |
+| TC module | Updated by the temporal optimizer | No optimizer step | No optimizer step |
+| NT-Xent objective | Used | Not used | Not used |
+| Cross-Entropy objective | Not used | Used | Used |
+
+Important details:
+
+- With the default `dinov3_freeze_backbone=True`, DINOv3 parameters are frozen.
+- In `train_linear`, `main_dinov3.py` freezes all model parameters and then re-enables gradients only for `model.classifier`.
+- In supervised mode, the loss is Cross-Entropy on the model logits. The TC optimizer is not stepped.
+- In self-supervised mode, the loss is computed from the TC losses and projections. The classifier logits do not directly contribute to the loss.
+
+### 8.8 Supervised Cross-Entropy loss
+
+In supervised and linear-evaluation modes, `trainer_dinov3.py` uses:
 
 ```python
-optimizer.step()
+criterion = nn.CrossEntropyLoss()
+loss = criterion(logits, labels)
 ```
 
-The actual update rule depends on the selected optimizer and its settings, such as learning rate and weight decay.
+The objective can be written without display-math formatting as:
 
-### 8.8 Which parameters are updated?
+`L_CE = CrossEntropyLoss(logits, labels)`
 
-The answer depends on the training mode and freezing configuration.
+PyTorch expects raw logits and integer class labels. Do not apply softmax to the logits before passing them to `nn.CrossEntropyLoss()`.
 
-| Parameter group | Self-supervised training | Linear evaluation |
-|---|---|---|
-| DINOv3 backbone | Updated if unfrozen and included in optimizer | Frozen |
-| Feature projection | Updated if trainable and included in optimizer | Frozen if using strict linear evaluation |
-| TC module | Updated if included in the optimizer | Usually not updated |
-| Classification head | Not directly trained by contrastive loss | Updated |
-| Loss coefficient 0.7 | Not updated | Not updated |
+### 8.9 Did replacing CNN with DINOv3 change the loss?
 
-This table describes the intended behavior. The actual parameter groups must be confirmed from the optimizer construction and training-mode logic.
+The integration changes the feature extraction path from the original CNN encoder to DINOv3 plus a feature adapter. The supplied DINOv3 trainer explicitly defines the self-supervised objective as:
 
-### 8.9 Important distinction: model parameters versus loss weights
+`L_total = L_TC_1 + L_TC_2 + 0.7 * L_NTXent`
 
-The coefficient 0.7 is a fixed scalar in the stated objective.
+It also uses Cross-Entropy for supervised and linear-evaluation modes.
 
-It is not a neural network parameter unless the implementation explicitly defines it as a trainable parameter.
+The original `trainer.py` uses a separate `NTXentLoss` implementation imported from `loss.py`, while `trainer_dinov3.py` defines a different `nt_xent_loss()` function. Therefore, the two implementations should not be assumed to be identical in every detail merely because both are called NT-Xent. For a scientific comparison, compare the positive-pair construction, negative-pair mask, batch-size handling, temperature, and loss reduction in both implementations.
 
-For the fixed-weight objective:
+### 8.10 Important implementation checks
 
-\[
-\mathcal{L}_{total}
-=
-\mathcal{L}_{TC}^{(1)}
-+
-\mathcal{L}_{TC}^{(2)}
-+
-0.7\mathcal{L}_{NT\text{-}Xent}
-\]
+Before running large experiments, verify:
 
-the optimizer updates the model parameters through gradients. It does not update the coefficient 0.7.
-
-### 8.10 What changes compared with the original TS-TCC encoder?
-
-The primary architectural change is the encoder and feature conversion pipeline.
-
-| Aspect | Original TS-TCC approach | DINOv3 integration |
-|---|---|---|
-| Feature extractor | Original CNN encoder | Pretrained DINOv3 backbone |
-| Input handling | Time-series augmentation and CNN input | Log-Mel to image-like tensor |
-| Feature conversion | CNN feature sequence | Patch tokens and feature projection |
-| Temporal module | TC module | TC module retained |
-| Contrastive objective | Temporal and contextual contrastive learning | Two TC terms and weighted NT-Xent as described |
-| Classification | Original classifier design | Classifier adapted to projected features |
-
-The total loss must be compared with the original repository's trainer to determine whether the loss formula itself changed or whether only the encoder was replaced. A statement about the original loss should not be made without checking its implementation.
-
-### 8.11 Supervised Cross-Entropy is a separate objective
-
-During supervised classification, the loss is usually:
-
-\[
-\mathcal{L}_{CE}
-=
--\frac{1}{B}\sum_{i=1}^{B}
-\log p_{i,y_i}
-\]
-
-The model receives classification logits, compares them with the ground-truth labels and calculates the loss.
-
-This objective is different from the self-supervised contrastive objective.
-
-Do not automatically add Cross-Entropy to the contrastive total loss. A combined objective such as
-
-\[
-\mathcal{L}
-=
-\mathcal{L}_{total}
-+
-\lambda_{CE}\mathcal{L}_{CE}
-\]
-
-is appropriate only if the actual training code explicitly implements joint self-supervised and supervised optimization.
+- The training batch size is compatible with the NT-Xent implementation.
+- The TC projection shape is two-dimensional and consistent for both views.
+- The configured temperature is positive.
+- The DINOv3 token layout matches the `1 + 4` special-token slice.
+- The selected training mode loads the intended checkpoint.
+- The optimizer contains only the parameters intended to be trained.
+- The supervised and self-supervised metrics are interpreted separately.
 
 ---
 
-## 9. Model Training and Evaluation
+## 9. Training Modes
 
-### 9.1 Validation
+### 9.1 Mode comparison
 
-Validation is used to monitor model behavior during training and select a checkpoint.
+| Mode | Main objective | Input used for loss | Parameters updated |
+|---|---|---|---|
+| `self_supervised` | TC losses + weighted NT-Xent | Two augmented views | Trainable model parameters and TC parameters |
+| `supervised` | Cross-Entropy | Original data and labels | Trainable model parameters |
+| `train_linear` | Cross-Entropy | Original data and labels | Classifier only |
 
-The implementation may evaluate:
+### 9.2 Self-supervised mode
 
-- Self-supervised validation loss.
-- Classification loss.
-- Classification accuracy.
-- Other task-specific metrics.
+The model receives `aug1` and `aug2`. It learns representations through the temporal contrastive loss and NT-Xent. The classifier is not directly trained by this objective.
 
-The correct metric depends on the training mode.
+### 9.3 Supervised mode
 
-### 9.2 Test evaluation
+The model receives the original `data` tensor. The classifier produces logits, which are compared with the ground-truth labels using Cross-Entropy.
 
-After training, the selected checkpoint is evaluated on the test set.
+If the DINOv3 backbone is frozen, the feature projection and classifier can still be trained.
 
-The test set should not be used to select hyperparameters or repeatedly choose the best checkpoint, because this can lead to an overly optimistic estimate of generalization performance.
+### 9.4 Linear evaluation
 
-### 9.3 Recommended evaluation metrics
+The code loads the self-supervised checkpoint and freezes all model parameters, then enables gradients only for the classifier:
 
-For a classification task, useful metrics include:
+```python
+for parameter in model.parameters():
+    parameter.requires_grad = False
 
-| Metric | Purpose |
-|---|---|
-| Accuracy | Overall proportion of correct predictions |
-| Precision | Reliability of positive predictions |
-| Recall | Ability to identify positive examples |
-| F1-score | Balance between precision and recall |
-| Confusion matrix | Shows correct and incorrect class predictions |
+for parameter in model.classifier.parameters():
+    parameter.requires_grad = True
+```
 
-For multiclass classification, the averaging method used for precision, recall and F1-score should be stated explicitly.
-
-### 9.4 Reproducibility
-
-For a fair comparison between the original and modified models:
-
-- Use the same dataset split.
-- Keep the preprocessing pipeline consistent where appropriate.
-- Record the random seed.
-- Record optimizer settings.
-- Record the backbone freezing configuration.
-- Record the selected checkpoint.
-- Report the evaluation protocol and metrics.
-
-No performance improvement should be claimed until supported by actual experiment results.
+This mode evaluates whether the learned representation supports classification with a trainable linear layer. The TC module is not optimized in this mode.
 
 ---
 
 ## 10. Checkpoints and Outputs
 
-The integration documentation describes two checkpoint names:
+### 10.1 Output directory
 
-- `ckp_best.pt`: checkpoint selected using validation performance.
-- `ckp_last.pt`: checkpoint from the last training epoch.
+The run directory is built from:
 
-The actual save directory depends on the experiment configuration.
+```text
+<logs_save_dir>/<experiment_description>/<run_description>/<training_mode>_seed_<seed>/
+```
 
-A complete experiment record should include:
+With the default arguments, a run is stored under a path similar to:
 
-- Model configuration.
-- Dataset and split information.
-- Training mode.
-- Random seed.
-- Optimizer settings.
-- Training and validation logs.
-- Best checkpoint.
-- Final test metrics.
+```text
+experiments_logs/
+└── SpeechOcean762_DINOv3_TS-TCC/
+    └── Exp1/
+        └── DINOv3/
+            ├── self_supervised_seed_0/
+            ├── supervised_seed_0/
+            └── train_linear_seed_0/
+```
 
-The checkpoint should contain the state needed to reproduce the intended evaluation. Depending on the implementation, this may include the encoder, feature projection, TC module, classifier, optimizer state and epoch information.
+Each run contains a training log and a `saved_models` directory.
+
+### 10.2 Checkpoint files
+
+| File | Purpose |
+|---|---|
+| `ckp_best.pt` | Checkpoint with the lowest validation loss |
+| `ckp_last.pt` | Checkpoint saved at the end of the latest epoch |
+
+The checkpoint stores the model state, TC state, optimizer states, epoch, and best validation loss.
+
+### 10.3 Metrics
+
+The trainer logs:
+
+- Training loss
+- Validation loss
+- Training accuracy for classification modes
+- Validation accuracy for classification modes
+- Best validation checkpoint
+
+After training, `main_dinov3.py` reloads `ckp_best.pt` and evaluates it on the test set. In self-supervised mode, the reported loss is the self-supervised objective and accuracy is set to zero; it is not a classification accuracy result.
 
 ---
 
 ## 11. Troubleshooting
 
-### 11.1 DINOv3 model loading fails
-
-Possible causes:
-
-- Incorrect model ID.
-- Unsupported Transformers version.
-- Missing internet access or cached weights.
-- Model access or weight-loading issues.
-
-Check the model ID and the loading code before changing the architecture.
-
-### 11.2 Input tensor shape is incorrect
-
-Confirm that the data loader returns the expected Log-Mel dimensions and that the adapter produces the correct number of image channels.
-
-Inspect the shapes at each stage of the forward pass.
-
-### 11.3 Patch token count is incorrect
-
-For a 224 × 224 image and patch size 16, the expected patch grid is 14 × 14.
-
-The number of special tokens depends on the model configuration. Verify the actual output before removing tokens by index.
-
-### 11.4 Loss becomes NaN or infinite
-
-Check:
-
-- Input data for invalid values.
-- Learning rate.
-- Temperature in NT-Xent.
-- Loss components individually.
-- Gradient magnitudes.
-- Numerical stability in the contrastive calculation.
-
-Check each loss term before combining them into the total objective.
-
-### 11.5 GPU memory usage is too high
-
-Possible approaches include:
-
-- Reducing batch size.
-- Freezing the DINOv3 backbone.
-- Using supported mixed precision.
-- Reducing unnecessary tensor retention.
-- Using gradient accumulation if compatible with the training loop.
-
-### 11.6 Parameters do not update
-
-Check:
-
-- Whether `requires_grad` is enabled.
-- Whether the parameter is included in the optimizer.
-- Whether the loss depends on that parameter.
-- Whether the training loop calls `backward()` and `step()`.
-- Whether gradients are unexpectedly zero or absent.
-
-A frozen backbone can produce valid features without updating its pretrained weights.
-
-### 11.7 The classification head does not learn
-
-Confirm that the selected training mode uses labeled data and calculates a classification loss. The self-supervised contrastive objective alone does not directly optimize classification logits unless the classification head is connected to that objective.
+| Problem | Likely cause | What to check |
+|---|---|---|
+| DINOv3 weights fail to load | Model ID, network, cache, or Transformers compatibility | Confirm the model ID and installed Transformers version |
+| CUDA is requested but unavailable | CPU-only PyTorch or unavailable GPU | Check `torch.cuda.is_available()` |
+| Wrong patch-token count | Different model variant or image size | Check the backbone output and patch configuration |
+| NT-Xent raises an error | Batch size below 2 or projection shape mismatch | Confirm batch size and both projection shapes |
+| Loss is NaN or infinite | Invalid input, unstable numerical values, or configuration issue | Inspect individual loss terms and the temperature |
+| Linear evaluation cannot find a checkpoint | Run directory, seed, or experiment settings do not match | Reuse the same experiment, run, seed, and log directory |
+| GPU memory is too high | Large batch or trainable backbone | Reduce batch size or freeze the backbone |
+| Classifier does not learn in self-supervised mode | The self-supervised loss does not directly use classifier logits | Use `supervised` or `train_linear` to train the classifier |
 
 ---
 
-## 12. Limitations and Future Improvements
+## 12. Limitations and Future Work
 
 ### 12.1 Limitations
 
-- DINOv3 is a visual backbone, so Log-Mel input conversion introduces a difference between pretraining data and the target representation.
-- Spatial patch aggregation may remove information that could be useful for speech-related temporal modeling.
-- The quality of the learned representation depends on the input preprocessing and augmentation strategy.
-- A frozen backbone limits adaptation to the target dataset.
-- Training results depend on the dataset split, optimizer settings and training configuration.
+- DINOv3 is pretrained for visual representation learning, not specifically for speech.
+- Resizing Log-Mel features to a square image changes their original aspect ratio.
+- Averaging one patch-grid axis reduces information and does not guarantee a perfect alignment between the resulting 14 steps and speech time.
+- The default frozen backbone limits adaptation of DINOv3 weights to the target dataset.
+- The original and integrated NT-Xent implementations should be compared carefully before claiming that the objectives are mathematically identical.
 
-### 12.2 Future improvements
+### 12.2 Possible improvements
 
-Possible future work includes:
+- Compare frozen and fine-tuned DINOv3 backbones.
+- Compare different feature aggregation methods.
+- Study the effect of the NT-Xent weight and temperature.
+- Compare with the original CNN-based TS-TCC baseline under the same data split.
+- Report results over multiple seeds.
+- Evaluate the model using clearly defined classification metrics and a held-out test set.
 
-- Comparing frozen and fine-tuned DINOv3 backbones.
-- Testing different feature projection dimensions.
-- Comparing the mean-based patch aggregation with other pooling methods.
-- Studying the effect of the NT-Xent coefficient.
-- Comparing the modified architecture with the original TS-TCC baseline.
-- Evaluating different augmentation strategies.
-- Reporting results over multiple random seeds.
-
-These are possible research directions, not claims that the current implementation already supports them.
+These are suggested experiments, not claims about results already obtained.
 
 ---
 
 ## 13. References
 
-1. **TS-TCC: Time-Series Representation Learning via Temporal and Contextual Contrasting.** Refer to the original paper and repository for the baseline architecture and training objective.
-
-2. **DINOv3: Self-Supervised Learning for Visual Features.** Refer to the official repository for the pretrained models, architecture and usage requirements:  
+1. **DINOv3** — official repository and model information:  
    https://github.com/facebookresearch/dinov3
 
-3. **Hugging Face Transformers.** Refer to the official documentation for loading pretrained models:  
+2. **Hugging Face Transformers** — pretrained model loading and model outputs:  
    https://huggingface.co/docs/transformers/
 
-4. **PyTorch.** Refer to the official documentation for autograd, optimizers and loss functions:  
+3. **PyTorch** — autograd, optimizers, and loss functions:  
    https://pytorch.org/docs/stable/
+
+4. **TS-TCC** — consult the original paper and the repository used as the baseline for the temporal and contextual contrastive learning design.
 
 ---
 
-## Final Notes
+## Reproducibility Checklist
 
-This README describes the intended DINOv3 + TS-TCC integration and the loss structure documented for this project.
+Before reporting results, record the following:
 
-Before using it as the final technical documentation, verify the source code for the following items:
-
-- The actual DINOv3 model ID and token layout.
-- The input adapter and feature projection dimensions.
-- The implementation of the TC loss.
-- The implementation of NT-Xent and its temperature.
-- The total loss formula and coefficient.
-- The optimizer parameter groups for each training mode.
-- The actual checkpoint paths and supported command-line arguments.
-
-These checks are important because a README should describe the code that actually runs, not only the architecture that the project intends to implement.
+- [ ] Dataset version and train/validation/test split
+- [ ] DINOv3 model ID and Transformers version
+- [ ] Whether the DINOv3 backbone is frozen
+- [ ] Input size and feature projection dimension
+- [ ] Training mode and random seed
+- [ ] Batch size, learning rate, temperature, and optimizer
+- [ ] Best validation checkpoint
+- [ ] Test metrics and evaluation procedure
+- [ ] Any differences between the original and integrated NT-Xent implementations
